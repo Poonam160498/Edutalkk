@@ -43,6 +43,16 @@ npm run build
 
 The `dist/` folder is a static site — drag-drop it onto [Netlify Drop](https://app.netlify.com/drop) or host it anywhere.
 
+## Live backend (Supabase)
+
+Login, wallet, per-minute billing and EduMall orders can run on a real Supabase database. Without keys the app runs in demo mode (in-memory, 1 min = 10 sec).
+
+1. Create a Supabase project, open **SQL Editor**, paste [`supabase/schema.sql`](supabase/schema.sql) and run it.
+2. Copy `.env.example` to `.env` and fill in the Project URL and publishable (anon) key.
+3. `npm run dev` — the app now asks for login, and all money logic runs in the database (prices, balance checks and billing are enforced server-side; the browser can only read its own rows).
+
+Before real launch: set `allow_test_recharge = false` in `app_settings` and add Razorpay.
+
 ## Backend design
 
 This repo is the frontend prototype (state is in-memory). The full production backend design — PostgreSQL schema, REST + WebSocket API, the per-minute billing engine with row-locking, matching/queue logic, payouts, and trust & safety — is documented in [docs/backend-design.md](docs/backend-design.md).

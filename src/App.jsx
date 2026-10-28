@@ -5,8 +5,12 @@ import {
   FileText, ClipboardList, Target, CalendarCheck, Zap, Gift, Plus,
   PenLine, PhoneOff, TrendingUp, BookOpen, GraduationCap, CheckCircle2,
   Sparkles, ShoppingCart, Pencil, Calculator, Headphones, Backpack,
-  Ruler, Lamp, Watch, Tablet, Package, Truck, Minus, Bot
+  Ruler, Lamp, Watch, Tablet, Package, Truck, Minus, Bot, LogOut, Loader2
 } from "lucide-react";
+import { supabase, isLive, api, loadAccount, toOrder, friendlyError } from "./lib/backend";
+
+// Live mode mein 1 minute = 60 sec; demo mein 10 sec taaki billing jaldi dikhe
+const MINUTE_SEC = isLive ? 60 : 10;
 
 const TUTORS = [
   { id: 1, name: "Ananya Rao", init: "AR", color: "bg-purple-100 text-purple-700", subjects: "Maths, JEE Adv", langs: "Hindi, English", exp: 6, rating: 4.9, orders: "21,540", price: 6, cut: 20, status: "online", verified: true },
@@ -182,7 +186,7 @@ function TutorCard({ t, mode, free, onStart }) {
   );
 }
 
-function SessionScreen({ tutor, mode, price, free, balance, onDeduct, onEnd, minimized, onMinimize, onMaximize }) {
+function SessionScreen({ tutor, mode, price, free, freeMinutes, balance, onDeduct, onMinute, onEnd, minimized, onMinimize, onMaximize }) {
   const [sec, setSec] = useState(0);
   const [spent, setSpent] = useState(0);
   const [msgs, setMsgs] = useState([
@@ -203,25 +207,42 @@ function SessionScreen({ tutor, mode, price, free, balance, onDeduct, onEnd, min
   const msgsRef = useRef(msgs);
   msgsRef.current = msgs;
 
+  const secRef = useRef(0);
   useEffect(() => {
+    let stopped = false;
+    const finish = (n, reason) => {
+      stopped = true;
+      clearInterval(iv);
+      setEnded(reason);
+      setTimeout(() => onEnd(n, spentRef.current, true, reason), 900);
+    };
     const iv = setInterval(() => {
-      setSec((s) => {
-        const n = s + 1;
-        if (!free && n % 10 === 0) {
-          if (balance - spentRef.current >= price) {
-            spentRef.current += price;
+      if (stopped) return;
+      const n = ++secRef.current;
+      setSec(n);
+      if (n % MINUTE_SEC !== 0) return;
+      if (onMinute) {
+        // Live: server har minute ka hisaab rakhta hai
+        onMinute()
+          .then((r) => {
+            if (stopped || !r) return;
+            spentRef.current = Number(r.spent) || 0;
             setSpent(spentRef.current);
-            onDeduct(price);
-          } else {
-            clearInterval(iv);
-            setEnded(true);
-            setTimeout(() => onEnd(n, spentRef.current, true), 900);
-          }
-        }
-        return n;
-      });
+            if (r.ended) finish(n, r.reason || "low_balance");
+          })
+          .catch(() => {});
+      } else if (!free) {
+        if (balance - spentRef.current >= price) {
+          spentRef.current += price;
+          setSpent(spentRef.current);
+          onDeduct(price);
+        } else finish(n, "low_balance");
+      }
     }, 1000);
-    return () => clearInterval(iv);
+    return () => {
+      stopped = true;
+      clearInterval(iv);
+    };
   }, []);
 
   useEffect(() => {
@@ -297,7 +318,7 @@ function SessionScreen({ tutor, mode, price, free, balance, onDeduct, onEnd, min
 
       {free ? (
         <div className="bg-green-50 border-b border-green-200 px-3 py-1.5 text-center text-[11px] font-semibold text-green-700">
-          🎉 First session FREE — koi charge nahi lagega
+          🎉 First session FREE{freeMinutes ? ` (${freeMinutes} min tak)` : ""} — koi charge nahi lagega
         </div>
       ) : (
         <div className={`border-b px-3 py-1.5 text-center text-[11px] font-semibold ${low ? "bg-red-50 border-red-200 text-red-600" : "bg-yellow-50 border-yellow-200 text-yellow-700"}`}>
@@ -343,7 +364,13 @@ function SessionScreen({ tutor, mode, price, free, balance, onDeduct, onEnd, min
             </div>
           </div>
         )}
-        {ended && <p className="text-center text-xs text-red-500 font-semibold pt-2">Balance khatam — session end ho raha hai…</p>}
+        {ended && (
+          <p className="text-center text-xs text-red-500 font-semibold pt-2">
+            {ended === "free_limit" ? "Free session ka time poora hua — session end ho raha hai…"
+              : ended === "disconnect" ? "Connection toot gaya — session end ho raha hai…"
+              : "Balance khatam — session end ho raha hai…"}
+          </p>
+        )}
       </div>
 
       <div className="px-3 py-2.5 border-t border-gray-200 bg-white flex items-center gap-2">
@@ -361,7 +388,77 @@ function SessionScreen({ tutor, mode, price, free, balance, onDeduct, onEnd, min
           <PhoneOff size={16} className="text-white" />
         </button>
       </div>
-      <p className="text-center text-[10px] text-gray-400 pb-1.5 bg-white">Demo speed: 1 min = 10 sec</p>
+      {!isLive && <p className="text-center text-[10px] text-gray-400 pb-1.5 bg-white">Demo speed: 1 min = 10 sec</p>}
+    </div>
+  );
+}
+
+function AuthScreen({ ready }) {
+  const [mode, setMode] = useState("login");
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState(null);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setMsg(null);
+    if (mode === "signup" && !name.trim()) return setMsg({ err: true, text: "Apna naam likho" });
+    setLoading(true);
+    try {
+      if (mode === "signup") {
+        const r = await api.signUp(name.trim(), email.trim(), password);
+        if (!r.session) setMsg({ err: false, text: "Account ban gaya! Email mein aaya confirmation link kholo, phir login karo." });
+      } else {
+        await api.signIn(email.trim(), password);
+      }
+    } catch (err) {
+      setMsg({ err: true, text: friendlyError(err) });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const input = "w-full bg-gray-100 rounded-xl px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-yellow-400";
+
+  return (
+    <div className="min-h-screen bg-gray-200 flex items-center justify-center p-4 font-sans">
+      <div className="relative w-full max-w-sm bg-gray-50 rounded-3xl overflow-hidden shadow-2xl border-8 border-gray-900 flex flex-col" style={{ height: 780 }}>
+        <div className="bg-yellow-400 px-6 pt-14 pb-10 text-center">
+          <div className="w-16 h-16 mx-auto rounded-2xl bg-gray-900 flex items-center justify-center">
+            <GraduationCap size={34} className="text-yellow-400" />
+          </div>
+          <p className="font-extrabold text-2xl text-gray-900 mt-4">EduTalk</p>
+          <p className="text-xs text-gray-700 font-medium">Learn on demand · pehla session FREE</p>
+        </div>
+        {!ready ? (
+          <div className="flex-1 flex items-center justify-center">
+            <Loader2 size={28} className="animate-spin text-yellow-500" />
+          </div>
+        ) : (
+          <form onSubmit={submit} className="flex-1 px-6 -mt-5">
+            <div className="bg-white rounded-2xl shadow-lg p-5 space-y-3">
+              <div className="flex bg-gray-100 rounded-xl p-1">
+                {[["login", "Login"], ["signup", "Naya account"]].map(([k, l]) => (
+                  <button key={k} type="button" onClick={() => { setMode(k); setMsg(null); }}
+                    className={`flex-1 py-2 rounded-lg text-xs font-bold ${mode === k ? "bg-yellow-400 text-gray-900" : "text-gray-500"}`}>
+                    {l}
+                  </button>
+                ))}
+              </div>
+              {mode === "signup" && <input className={input} placeholder="Aapka naam" value={name} onChange={(e) => setName(e.target.value)} />}
+              <input className={input} type="email" required placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} />
+              <input className={input} type="password" required minLength={6} placeholder="Password (6+ characters)" value={password} onChange={(e) => setPassword(e.target.value)} />
+              {msg && <p className={`text-xs font-semibold ${msg.err ? "text-red-500" : "text-green-600"}`}>{msg.text}</p>}
+              <button disabled={loading} className="w-full bg-gray-900 text-yellow-400 font-bold text-sm py-3 rounded-xl active:scale-[0.98] disabled:opacity-60 flex items-center justify-center gap-2">
+                {loading && <Loader2 size={16} className="animate-spin" />}
+                {mode === "signup" ? "Account banao" : "Login karo"}
+              </button>
+            </div>
+          </form>
+        )}
+      </div>
     </div>
   );
 }
@@ -387,6 +484,47 @@ export default function EduTalkApp() {
   const [orderDone, setOrderDone] = useState(null);
   const [addr, setAddr] = useState({ name: "", phone: "", address: "", pin: "" });
   const [payMode, setPayMode] = useState("wallet");
+  const [user, setUser] = useState(null);
+  const [authReady, setAuthReady] = useState(!isLive);
+  const [busy, setBusy] = useState(false);
+
+  // ---- Live mode: login state + account data ----
+  const refresh = async (uid = user?.id) => {
+    if (!isLive || !uid) return;
+    try {
+      const a = await loadAccount(uid);
+      setBalance(a.balance);
+      setFirstFree(a.firstFree);
+      setTxns(a.txns);
+      setOrders(a.orders);
+    } catch (e) {
+      setToast(friendlyError(e));
+    }
+  };
+
+  useEffect(() => {
+    if (!isLive) return;
+    supabase.auth.getSession().then(({ data }) => {
+      setUser(data.session?.user ?? null);
+      setAuthReady(true);
+    });
+    const { data } = supabase.auth.onAuthStateChange((_e, sess) => setUser(sess?.user ?? null));
+    return () => data.subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (user) refresh(user.id);
+  }, [user?.id]);
+
+  const logout = async () => {
+    await api.signOut();
+    setWalletOpen(false);
+    setBalance(0);
+    setTxns([]);
+    setOrders([]);
+    setCart([]);
+    setTab("home");
+  };
 
   useEffect(() => {
     if (!toast) return;
@@ -397,28 +535,77 @@ export default function EduTalkApp() {
   const addTxn = (type, amount, note) =>
     setTxns((t) => [{ type, amount, note, time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) }, ...t]);
 
-  const startSession = (t, mode, price) => {
+  const startSession = async (t, mode, price) => {
     if (!firstFree && balance < price) {
       setWalletOpen(true);
       setToast("Session start karne ke liye recharge karo");
       return;
     }
+    if (isLive) {
+      if (busy) return;
+      setBusy(true);
+      try {
+        const r = await api.startSession(t.id, mode);
+        setSessionMin(false);
+        setSession({ id: r.session_id, tutor: t, mode, price: Number(r.price), free: r.free, freeMinutes: r.free_minutes, startBalance: balance });
+        if (r.free) setFirstFree(false);
+      } catch (e) {
+        const msg = friendlyError(e);
+        setToast(msg);
+        if (/recharge/.test(msg)) setWalletOpen(true);
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
     setSessionMin(false);
-    setSession({ tutor: t, mode, price, free: firstFree });
+    setSession({ tutor: t, mode, price, free: firstFree, startBalance: balance });
   };
 
-  const endSession = (sec, spent, autoEnded) => {
+  const sessionTick = async (id) => {
+    const r = await api.tick(id);
+    if (r?.balance != null) setBalance(Number(r.balance));
+    return r;
+  };
+
+  const endSession = async (sec, spent, autoEnded, reason) => {
     const s = session;
     setSession(null);
     setSessionMin(false);
-    if (s.free) setFirstFree(false);
-    if (spent > 0) addTxn("debit", spent, `${s.tutor.isAI ? "AI chat" : s.mode === "call" ? "Call" : "Chat"} — ${s.tutor.name}`);
-    setSummary({ tutor: s.tutor, sec, spent, free: s.free, autoEnded });
+    if (isLive) {
+      try {
+        if (!autoEnded) {
+          const r = await api.endSession(s.id);
+          spent = Number(r.spent) || 0;
+        }
+      } catch (e) {
+        setToast(friendlyError(e));
+      }
+      refresh();
+    } else {
+      if (s.free) setFirstFree(false);
+      if (spent > 0) addTxn("debit", spent, `${s.tutor.isAI ? "AI chat" : s.mode === "call" ? "Call" : "Chat"} — ${s.tutor.name}`);
+    }
+    setSummary({ tutor: s.tutor, sec, spent, free: s.free, autoEnded, reason });
     setRating(0);
   };
 
-  const recharge = (p) => {
+  const recharge = async (p) => {
     const total = p.amt + p.bonus;
+    if (isLive) {
+      if (busy) return;
+      setBusy(true);
+      try {
+        await api.recharge(p.amt);
+        await refresh();
+        setToast(`₹${total} wallet mein add ho gaye ✓`);
+      } catch (e) {
+        setToast(friendlyError(e));
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
     setBalance((b) => b + total);
     addTxn("credit", total, `Recharge ₹${p.amt}${p.bonus ? ` + ₹${p.bonus} bonus` : ""}`);
     setToast(`₹${total} wallet mein add ho gaye ✓`);
@@ -442,7 +629,7 @@ export default function EduTalkApp() {
   const total = subtotal + delivery;
   const cartCount = cart.reduce((s, i) => s + i.qty, 0);
 
-  const placeOrder = () => {
+  const placeOrder = async () => {
     if (cart.length === 0) return;
     if (hasPhysical && (!addr.name || !addr.phone || !addr.address || !addr.pin)) {
       setToast("Delivery address poora bharo");
@@ -450,6 +637,23 @@ export default function EduTalkApp() {
     }
     if (payMode === "wallet" && balance < total) {
       setToast("Wallet balance kam hai — recharge karo ya COD choose karo");
+      return;
+    }
+    if (isLive) {
+      if (busy) return;
+      setBusy(true);
+      try {
+        const r = await api.placeOrder(cart, payMode, addr);
+        const order = toOrder({ code: r.code, items: r.items, total: r.total, pay_mode: payMode });
+        setCart([]);
+        setCartOpen(false);
+        setOrderDone(order);
+        refresh();
+      } catch (e) {
+        setToast(friendlyError(e));
+      } finally {
+        setBusy(false);
+      }
       return;
     }
     if (payMode === "wallet") {
@@ -504,6 +708,8 @@ export default function EduTalkApp() {
       </div>
     </div>
   );
+
+  if (isLive && (!authReady || !user)) return <AuthScreen ready={authReady} />;
 
   return (
     <div className="min-h-screen bg-gray-200 flex items-center justify-center p-4 font-sans">
@@ -746,8 +952,10 @@ export default function EduTalkApp() {
             mode={session.mode}
             price={session.price}
             free={session.free}
-            balance={balance}
+            freeMinutes={isLive ? session.freeMinutes : null}
+            balance={session.startBalance}
             onDeduct={(p) => setBalance((b) => b - p)}
+            onMinute={isLive ? () => sessionTick(session.id) : null}
             onEnd={endSession}
             minimized={sessionMin}
             onMinimize={() => setSessionMin(true)}
@@ -761,7 +969,12 @@ export default function EduTalkApp() {
               <button onClick={() => setWalletOpen(false)} className="active:scale-95">
                 <ChevronLeft size={22} className="text-gray-900" />
               </button>
-              <p className="font-bold text-gray-900">My Wallet</p>
+              <p className="font-bold text-gray-900 flex-1">My Wallet</p>
+              {isLive && (
+                <button onClick={logout} className="flex items-center gap-1 text-xs font-semibold text-gray-900 active:scale-95">
+                  <LogOut size={14} /> Logout
+                </button>
+              )}
             </div>
             <div className="flex-1 overflow-y-auto">
               <div className="m-4 bg-gray-900 rounded-2xl p-5 text-center">
@@ -786,7 +999,9 @@ export default function EduTalkApp() {
                   </button>
                 ))}
               </div>
-              <p className="text-center text-[11px] text-gray-400 mt-3">UPI · Cards · NetBanking · Wallets</p>
+              <p className="text-center text-[11px] text-gray-400 mt-3">
+                {isLive ? "Test mode: abhi recharge bina payment ke hota hai (Razorpay jaldi aayega)" : "UPI · Cards · NetBanking · Wallets"}
+              </p>
               <p className="px-4 text-sm font-bold text-gray-900 mt-5">Transactions</p>
               <div className="px-4 py-2 space-y-2 pb-6">
                 {txns.length === 0 && <p className="text-xs text-gray-400 text-center py-4">Abhi tak koi transaction nahi</p>}
@@ -982,7 +1197,13 @@ export default function EduTalkApp() {
               <p className="text-xs text-gray-500 mt-1">
                 {summary.tutor.name} · {Math.floor(summary.sec / 60)}m {summary.sec % 60}s
               </p>
-              {summary.autoEnded && <p className="text-[11px] text-red-500 font-semibold mt-1">Balance khatam hone se session auto-end hua</p>}
+              {summary.autoEnded && (
+                <p className="text-[11px] text-red-500 font-semibold mt-1">
+                  {summary.reason === "free_limit" ? "Free session ka time poora hua"
+                    : summary.reason === "disconnect" ? "Connection tootne se session end hua"
+                    : "Balance khatam hone se session auto-end hua"}
+                </p>
+              )}
               <div className="bg-gray-50 rounded-xl py-2.5 mt-3">
                 <p className="text-[11px] text-gray-500">Total charge</p>
                 <p className="text-xl font-extrabold text-gray-900">{summary.free ? "FREE 🎉" : `₹${summary.spent}`}</p>
